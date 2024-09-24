@@ -5,34 +5,27 @@ import glob
 import gzip
 import tarfile
 from logging import getLogger
-from typing import Dict, List, Any
-
-from wxflow import (AttrDict,
-                    FileHandler,
+from typing import Any, Dict, Optional
+from wxflow import (AttrDict, Task, FileHandler,
                     add_to_datetime, to_fv3time, to_timedelta,
-                    chdir,
-                    to_fv3time,
                     YAMLFile, parse_j2yaml, save_as_yaml,
-                    logit,
-                    Executable,
-                    WorkflowException)
-from pygfs.task.analysis import Analysis
+                    logit)
+from pygfs.jedi import Jedi
 
 logger = getLogger(__name__.split('.')[-1])
 
 
-class AerosolAnalysis(Analysis):
+class AerosolAnalysis(Task):
     """
     Class for global aerosol analysis tasks
     """
     @logit(logger, name="AerosolAnalysis")
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any], yaml_name: Optional[str] = None):
         super().__init__(config)
 
         _res = int(self.task_config['CASE'][1:])
         _res_anl = int(self.task_config['CASE_ANL'][1:])
         _window_begin = add_to_datetime(self.task_config.current_cycle, -to_timedelta(f"{self.task_config['assim_freq']}H") / 2)
-        _jedi_yaml = os.path.join(self.task_config.DATA, f"{self.task_config.RUN}.t{self.task_config['cyc']:02d}z.aerovar.yaml")
 
         # Create a local dictionary that is repeatedly used across this class
         local_dict = AttrDict(
@@ -50,28 +43,57 @@ class AerosolAnalysis(Analysis):
                 'OPREFIX': f"{self.task_config.RUN}.t{self.task_config.cyc:02d}z.",
                 'APREFIX': f"{self.task_config.RUN}.t{self.task_config.cyc:02d}z.",
                 'GPREFIX': f"gdas.t{self.task_config.previous_cycle.hour:02d}z.",
-                'jedi_yaml': _jedi_yaml,
             }
         )
 
         # Extend task_config with local_dict
         self.task_config = AttrDict(**self.task_config, **local_dict)
 
+        # Create JEDI object
+        self.jedi = Jedi(self.task_config, yaml_name)
+
     @logit(logger)
-    def initialize(self: Analysis) -> None:
+    def initialize_jedi(self):
+        # get JEDI-to-FV3 increment converter config and save to YAML file
+        logger.info(f"Generating JEDI YAML config: {self.jedi.yaml}")
+        self.jedi.set_config(self.task_config)
+        logger.debug(f"JEDI config:\n{pformat(self.jedi.config)}")
+
+        # save JEDI config to YAML file
+        logger.debug(f"Writing JEDI YAML config to: {self.jedi.yaml}")
+        save_as_yaml(self.jedi.config, self.jedi.yaml)
+
+        # link JEDI executable
+        logger.info(f"Linking JEDI executable {self.task_config.JEDIEXE} to {self.jedi.exe}")
+        self.jedi.link_exe(self.task_config)
+        
+    @logit(logger)
+    def initialize(self) -> None:
         """Initialize a global aerosol analysis
 
         This method will initialize a global aerosol analysis using JEDI.
         This includes:
+        - staging observation files
+        - staging bias correction files
         - staging CRTM fix files
         - staging FV3-JEDI fix files
         - staging B error files
         - staging model backgrounds
-        - generating a YAML file for the JEDI executable
         - creating output directories
         """
-        super().initialize()
 
+        # stage observations
+        logger.info(f"Staging list of observation files generated from JEDI config")
+        obs_dict = self.jedi.get_obs_dict(self.task_config)
+        FileHandler(obs_dict).sync()
+        logger.debug(f"Observation files:\n{pformat(obs_dict)}")
+
+        # stage bias corrections
+        logger.info(f"Staging list of bias correction files generated from JEDI config")
+        bias_dict = self.jedi.get_bias_dict(self.task_config)
+        FileHandler(bias_dict).sync()
+        logger.debug(f"Bias correction files:\n{pformat(bias_dict)}")
+        
         # stage CRTM fix files
         logger.info(f"Staging CRTM fix files from {self.task_config.CRTM_FIX_YAML}")
         crtm_fix_list = parse_j2yaml(self.task_config.CRTM_FIX_YAML, self.task_config)
@@ -87,35 +109,17 @@ class AerosolAnalysis(Analysis):
         aero_var_stage_list = parse_j2yaml(self.task_config.AERO_STAGE_VARIATIONAL_TMPL, self.task_config)
         FileHandler(aero_var_stage_list).sync()
 
-        # generate variational YAML file
-        logger.debug(f"Generate variational YAML file: {self.task_config.jedi_yaml}")
-        save_as_yaml(self.task_config.jedi_config, self.task_config.jedi_yaml)
-        logger.info(f"Wrote variational YAML to: {self.task_config.jedi_yaml}")
+    @logit(logger)
+    def execute(self, aprun_cmd: str, jedi_args: Optional[str] = None) -> None:
+        if jedi_args:
+            logger.info(f"Executing {self.jedi.exe} {' '.join(jedi_args)} {self.jedi.yaml}")
+        else:
+            logger.info(f"Executing {self.jedi.exe} {self.jedi.yaml}")
+
+        self.jedi.execute(self.task_config, aprun_cmd, jedi_args)
 
     @logit(logger)
-    def variational(self: Analysis) -> None:
-
-        chdir(self.task_config.DATA)
-
-        exec_cmd = Executable(self.task_config.APRUN_AEROANL)
-        exec_name = os.path.join(self.task_config.DATA, 'gdas.x')
-        exec_cmd.add_default_arg(exec_name)
-        exec_cmd.add_default_arg('fv3jedi')
-        exec_cmd.add_default_arg('variational')
-        exec_cmd.add_default_arg(self.task_config.jedi_yaml)
-
-        try:
-            logger.debug(f"Executing {exec_cmd}")
-            exec_cmd()
-        except OSError:
-            raise OSError(f"Failed to execute {exec_cmd}")
-        except Exception:
-            raise WorkflowException(f"An error occured during execution of {exec_cmd}")
-
-        pass
-
-    @logit(logger)
-    def finalize(self: Analysis) -> None:
+    def finalize(self) -> None:
         """Finalize a global aerosol analysis
 
         This method will finalize a global aerosol analysis using JEDI.
@@ -161,7 +165,7 @@ class AerosolAnalysis(Analysis):
         super().clean()
 
     @logit(logger)
-    def _add_fms_cube_sphere_increments(self: Analysis) -> None:
+    def _add_fms_cube_sphere_increments(self) -> None:
         """This method adds increments to RESTART files to get an analysis
         """
         if self.task_config.DOIAU:
@@ -177,45 +181,3 @@ class AerosolAnalysis(Analysis):
         incvars_list_path = os.path.join(self.task_config['PARMgfs'], 'gdas', 'aeroanl_inc_vars.yaml')
         incvars = YAMLFile(path=incvars_list_path)['incvars']
         super().add_fv3_increments(inc_template, bkg_template, incvars)
-
-    @logit(logger)
-    def get_bkg_dict(self, task_config: Dict[str, Any]) -> Dict[str, List[str]]:
-        """Compile a dictionary of model background files to copy
-
-        This method constructs a dictionary of FV3 RESTART files (coupler, core, tracer)
-        that are needed for global aerosol DA and returns said dictionary for use by the FileHandler class.
-
-        Parameters
-        ----------
-        task_config: Dict
-            a dictionary containing all of the configuration needed for the task
-
-        Returns
-        ----------
-        bkg_dict: Dict
-            a dictionary containing the list of model background files to copy for FileHandler
-        """
-        bkg_dict = {}
-        return bkg_dict
-
-    @logit(logger)
-    def get_berror_dict(self, config: Dict[str, Any]) -> Dict[str, List[str]]:
-        """Compile a dictionary of background error files to copy
-
-        This method will construct a dictionary of BUMP background error files
-        for global aerosol DA and return said dictionary for use by the FileHandler class.
-        This dictionary contains coupler and fv_tracer files
-        for correlation and standard deviation as well as NICAS localization.
-
-        Parameters
-        ----------
-        config: Dict
-            a dictionary containing all of the configuration needed
-
-        Returns
-        ----------
-        berror_dict: Dict
-            a dictionary containing the list of background error files to copy for FileHandler
-        """
-        berror_dict = {}
-        return berror_dict

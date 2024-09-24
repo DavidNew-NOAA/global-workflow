@@ -18,5 +18,7 @@ if __name__ == '__main__':
     config = cast_strdict_as_dtypedict(os.environ)
 
     # Instantiate the aerosol analysis task
-    AeroAnl = AerosolAnalysis(config)
-    AeroAnl.variational()
+    AeroAnl = AerosolAnalysis(config, 'aeroanlvar')
+
+    # Execute the JEDI variational analysis application
+    AeroAnl.variational(config.APRUNCFP, ['fv3jedi', 'variational'])
